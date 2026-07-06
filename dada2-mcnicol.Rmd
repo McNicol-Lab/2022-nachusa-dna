@@ -1,0 +1,936 @@
+---
+title: "DADA2 + Phyloseq Pipeline for 16S rDNA Landfill Microcosms"
+author: "Gavin McNicol / ecoφlab"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: readable
+params:
+  project: "landfill_microcosms"   # change per run
+  silva_path: "data/SILVA_SSU_r138_2019.RData"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = TRUE)
+```
+
+# Setup + Package Loading
+
+```{r dada2, eval = F}
+# library(devtools)
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("dada2")
+# BiocManager::install("phyloseq")
+# BiocManager::install("DECIPHER")
+# BiocManager::install("phangorn")
+# BiocManager::install("DESeq2")
+# BiocManager::install("microbiome")
+```
+
+```{r other-package}
+library(dada2)
+library(phyloseq)
+library(DECIPHER)
+library(phangorn)
+library(DESeq2)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(vegan)
+library(microbiome)
+library(doParallel)
+library(viridis)
+
+registerDoParallel(cores = parallel::detectCores() - 1)  # parallel processing
+```
+
+# Parameterized File Setup
+
+```{r file-paths}
+# Define paths (easy to change)
+data_dir <- "data"
+fwd_dir <- file.path(data_dir, "forward")
+rev_dir <- file.path(data_dir, "reverse")
+filt_dir <- file.path(data_dir, "filtered")
+
+dir.create(filt_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Get sorted fastq files
+fnFs <- sort(list.files(fwd_dir, pattern = "_R1", full.names = TRUE))
+fnRs <- sort(list.files(rev_dir, pattern = "_R2", full.names = TRUE))
+
+sample_names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+names(fnFs) <- sample_names
+names(fnRs) <- sample_names
+
+cat("Found", length(fnFs), "samples\n")
+```
+
+# Create/Import metadata file
+
+```{r load-metadata}
+# Option 1: Read from CSV (recommended)
+# all_metadata <- read.csv("data/metadata.csv", row.names = 1, stringsAsFactors = FALSE)
+
+# Option 2: If you need to create one from scratch (example)
+all_metadata <- data.frame(
+  sample = sample_names,
+  site = c("WW", "BP", "SW", "EW", "NW", "SP"),
+  # treatment = c("Control", "Fe(OH)3", ...),
+  status = "Live",
+  replicate = 1,
+  row.names = sample_names
+)
+
+# Important: Make sure row names match exactly
+rownames(all_metadata) <- all_metadata$sample   # or whatever your ID column is
+
+# Check alignment
+cat("Do row names match the ASV table?\n")
+cat(all(rownames(seqtab.nochim) == rownames(all_metadata)), "\n")
+```
+
+
+# Quality Check + Filtering (Modern `filterAndTrim`)
+
+```{r quality-filter}
+# Quality profiles 
+plotQualityProfile(fnFs[1:min(6, length(fnFs))])
+plotQualityProfile(fnRs[1:min(6, length(fnRs))])
+
+# Filter and trim
+filtFs <- file.path(filt_dir, basename(fnFs))
+filtRs <- file.path(filt_dir, basename(fnRs))
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs,
+                     trimLeft = c(19, 20),      # remove primers
+                     truncLen = c(150, 130),    # ← updated to 130 to be stricter on R2
+                     maxN = 0,
+                     maxEE = c(2, 2),           # or try c(2, 3) if too many reads lost
+                     truncQ = 2,
+                     compress = TRUE,
+                     multithread = TRUE)
+
+head(out)
+
+# Quality profiles again
+plotQualityProfile(filtFs[1:min(6, length(filtFs))])
+plotQualityProfile(filtRs[1:min(6, length(filtRs))])
+```
+
+
+# Error Learning + DADA2 (Better Practice)
+
+```{r learn-errors, cache=TRUE}
+# Learn error rates (this can take a while — verbose provides updates)
+cat("=== Learning error rates for Forward reads ===\n")
+errF <- learnErrors(filtFs, 
+                    multithread = TRUE, 
+                    randomize = TRUE, 
+                    nbases = 1e8,      # adjust based on your data size
+                    verbose = TRUE)    # ← This gives iterative progress updates
+
+cat("\n=== Learning error rates for Reverse reads ===\n")
+errR <- learnErrors(filtRs, 
+                    multithread = TRUE, 
+                    randomize = TRUE, 
+                    nbases = 1e8,
+                    verbose = TRUE)
+
+# Plot the learned error models
+plotErrors(errF, nominalQ = TRUE) + ggtitle("Forward Error Rates")
+plotErrors(errR, nominalQ = TRUE) + ggtitle("Reverse Error Rates")
+```
+
+
+```{r de-replicate}
+# Dereplicate
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+# Assign sample names (important!)
+names(derepFs) <- sample_names
+names(derepRs) <- sample_names
+
+cat("=== Running DADA on Forward reads ===\n")
+dadaFs <- dada(derepFs, err = errF, pool = TRUE, multithread = TRUE, verbose = TRUE)
+
+cat("\n=== Running DADA on Reverse reads ===\n")
+dadaRs <- dada(derepRs, err = errR, pool = TRUE, multithread = TRUE, verbose = TRUE)
+```
+
+
+# Merge Pairs + Chimera Remova
+
+ THIS DID NOT WORK -- Something to do with earlier PEAR merge?
+```{r merge-chimera, cache=TRUE, eval = F}
+# # ====================== MERGE PAIRS ======================
+# cat("=== Merging paired reads ===\n")
+# mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, 
+#                       verbose = TRUE,
+#                       minOverlap = 8,          # was 6 in old script
+#                       maxMismatch = 0,
+#                       trimOverhang = TRUE)
+# 
+# # Optional: also try a more lenient version if needed
+# # mergers2 <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, 
+# #                        verbose = TRUE, minOverlap = 6)
+# 
+# # ====================== SEQUENCE TABLE ======================
+# cat("=== Making sequence table ===\n")
+# seqtab <- makeSequenceTable(mergers)
+# 
+# # Remove chimeras
+# cat("=== Removing chimeras ===\n")
+# seqtab.nochim <- removeBimeraDenovo(seqtab, 
+#                                     method = "consensus", 
+#                                     multithread = TRUE, 
+#                                     verbose = TRUE)
+# 
+# # Summary of chimera removal
+# cat("\nSummary:\n")
+# cat("Input sequences:", sum(seqtab), "\n")
+# cat("After chimera removal:", sum(seqtab.nochim), "\n")
+# cat("Percent retained:", round(100 * sum(seqtab.nochim) / sum(seqtab), 1), "%\n")
+# 
+# # Track reads through pipeline
+# getN <- function(x) sum(getUniques(x))
+# track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), 
+#                sapply(mergers, getN), rowSums(seqtab.nochim))
+# colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nochim")
+# rownames(track) <- sample_names
+# head(track)
+```
+
+Simpler merge -- did not work either 
+```{r forward-only-reads}
+# # Use only Forward reads (much higher yield)
+# seqtab <- makeSequenceTable(dadaFs)                    # ← only Forward
+# seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", 
+#                                     multithread=TRUE, verbose=TRUE)
+# 
+# # Summary of chimera removal
+# cat("\nSummary:\n")
+# cat("Input sequences:", sum(seqtab), "\n")
+# cat("After chimera removal:", sum(seqtab.nochim), "\n")
+# cat("Percent retained:", round(100 * sum(seqtab.nochim) / sum(seqtab), 1), "%\n")
+# 
+# # Track reads through pipeline
+# getN <- function(x) sum(getUniques(x))
+# track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN),
+#                sapply(mergers, getN), rowSums(seqtab.nochim))
+# colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nochim")
+# rownames(track) <- sample_names
+# head(track)
+```
+
+# Forward only seqtab
+
+```{r seqtab-chimera-forward-only, cache=TRUE}
+# Use only Forward reads (best option given poor merging)
+cat("=== Making sequence table from Forward reads only ===\n")
+seqtab <- makeSequenceTable(dadaFs)
+
+cat("=== Removing chimeras ===\n")
+seqtab.nochim <- removeBimeraDenovo(seqtab, 
+                                    method = "consensus", 
+                                    multithread = TRUE, 
+                                    verbose = TRUE)
+
+# Summary
+cat("\nSummary:\n")
+cat("Input sequences:", sum(seqtab), "\n")
+cat("After chimera removal:", sum(seqtab.nochim), "\n")
+cat("Percent retained:", round(100 * sum(seqtab.nochim) / sum(seqtab), 1), "%\n")
+
+```
+
+# Create clean read tracking table for Table S3 (Supplemental)
+
+```{r}
+# === Create clean tracking table for Table S3 ===
+getN <- function(x) sum(getUniques(x))
+
+track <- data.frame(
+  sample     = sample_names,
+  input      = out[, "reads.in"],
+  filtered   = out[, "reads.out"],
+  denoisedF  = sapply(dadaFs, getN),
+  seqtab     = rowSums(seqtab),
+  nochim     = rowSums(seqtab.nochim)
+)
+
+# Add % retained at each step
+track$filtered_pct <- round(track$filtered / track$input * 100, 1)
+track$seqtab_pct   <- round(track$seqtab   / track$filtered * 100, 1)
+track$nochim_pct   <- round(track$nochim   / track$seqtab * 100, 1)
+track$final_pct    <- round(track$nochim   / track$input * 100, 1)
+
+# Nice column order
+track <- track[, c("sample", "input", "filtered", "filtered_pct", 
+                   "denoisedF", "seqtab", "seqtab_pct", 
+                   "nochim", "nochim_pct", "final_pct")]
+
+print(track)
+
+# Save for supplemental
+write_csv(track, "output/Table_S3_DADA2_read_tracking.csv")
+```
+
+
+
+
+# Taxonomy (DECIPHER)
+
+get SILVA dataset from: 
+url = "https://drive.google.com/uc?export=download&id=1w3wdSCpSihntWkbP_zvXz7r3s-tNB8DV",
+
+```{r}
+load("data/SILVA_SSU_r138.2_v2.RData")
+# The object is usually named `trainingSet`
+ls()  # should show trainingSet
+```
+
+
+```{r taxonomy-decipher, cache=TRUE}
+library(DECIPHER)
+
+# Prepare sequences
+dna <- DNAStringSet(getSequences(seqtab.nochim))
+
+cat("=== Running DECIPHER IdTaxa ===\n")
+ids <- IdTaxa(dna, 
+              trainingSet, 
+              strand = "top", 
+              threshold = 60, 
+              processors = NULL, 
+              verbose = TRUE)
+
+# Convert to tax table matrix
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species")
+taxid <- t(sapply(ids, function(x) {
+  m <- match(ranks, x$rank)
+  taxa <- x$taxon[m]
+  taxa[startsWith(taxa, "unclassified_")] <- NA
+  taxa
+}))
+
+colnames(taxid) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+rownames(taxid) <- getSequences(seqtab.nochim)
+
+# Save outputs
+saveRDS(seqtab.nochim, "output/seqtab_nochim_fwd.rds")
+saveRDS(taxid, "output/taxid_fwd.rds")
+
+cat("Taxonomy assignment complete. Assigned to", ncol(taxid), "ranks.\n")
+head(taxid[, 1:7])  # preview
+```
+
+# Make phyloseq object
+
+```{r make-phyloseq, cache=TRUE}
+# Create phyloseq object (forward-only)
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows = FALSE),
+               tax_table(taxid),
+               sample_data(all_metadata))   # ← load your metadata here first
+
+# Basic summary
+cat("Phyloseq object created with", nsamples(ps), "samples and", ntaxa(ps), "ASVs\n")
+cat("Taxonomic ranks:", colnames(tax_table(ps)), "\n")
+
+# Save it
+saveRDS(ps, "output/nachusa-2022-fwd-nochim.rds")
+
+# Optional: Quick summary at family/genus level
+ps_family <- tax_glom(ps, taxrank = "Family")
+ps_genus  <- tax_glom(ps, taxrank = "Genus")
+
+cat("Family-level ASVs:", ntaxa(ps_family), "\n")
+cat("Genus-level ASVs:", ntaxa(ps_genus), "\n")
+```
+# Final Phyloseq Object
+
+```{r finalize-and-summarize, cache=TRUE}
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows = FALSE),
+               tax_table(taxid),
+               sample_data(all_metadata))
+
+# Save everything
+saveRDS(ps, "output/ps-nachusa-2022-fwd-nochim-final.rds")
+saveRDS(ps_family, "output/ps-family.rds")
+saveRDS(ps_genus, "output/ps-genus.rds")
+
+# === FAMILY LEVEL TABLE ===
+cat("\n=== Top 20 Most Abundant Families ===\n")
+family_abund <- tax_glom(ps, taxrank = "Family") %>%
+  transform_sample_counts(function(x) 100 * x / sum(x)) %>%  # relative abundance
+  psmelt() %>%
+  group_by(Family) %>%
+  summarise(Mean_Rel_Abund = mean(Abundance), .groups = "drop") %>%
+  arrange(desc(Mean_Rel_Abund)) %>%
+  slice_head(n = 20)
+
+print(family_abund)
+
+# === GENUS LEVEL TABLE ===
+cat("\n=== Top 20 Most Abundant Genera ===\n")
+genus_abund <- tax_glom(ps, taxrank = "Genus") %>%
+  transform_sample_counts(function(x) 100 * x / sum(x)) %>%
+  psmelt() %>%
+  group_by(Genus) %>%
+  summarise(Mean_Rel_Abund = mean(Abundance), .groups = "drop") %>%
+  arrange(desc(Mean_Rel_Abund)) %>%
+  slice_head(n = 20)
+
+print(genus_abund)
+
+# Save tables
+write_csv(family_abund, "output/top_families.csv")
+write_csv(genus_abund, "output/top_genera.csv")
+```
+
+# Alpha Diversity Table + Plot
+
+```{r alpha-diversity, fig.width=10, fig.height=6}
+# Alpha diversity metrics
+alpha_div <- estimate_richness(ps, measures = c("Observed", "Shannon", "Simpson")) %>%
+  rownames_to_column("SampleID") %>%
+  left_join(all_metadata %>% rownames_to_column("SampleID"), by = "SampleID")
+
+cat("=== Alpha Diversity Summary ===\n")
+print(alpha_div)
+
+# Save table
+write.csv(alpha_div, "output/alpha_diversity.csv", row.names = FALSE)
+
+# Plot
+p_alpha <- alpha_div %>%
+  pivot_longer(cols = c(Observed, Shannon, Simpson),
+               names_to = "Metric", values_to = "Value") %>%
+  ggplot(aes(x = SampleID, y = Value, fill = SampleID)) +   # change fill to your main factor
+  geom_col() +
+  facet_wrap(~ Metric, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Alpha Diversity - Landfill Microcosms",
+       x = "", y = "Diversity Metric")
+
+print(p_alpha)
+ggsave("figures/alpha_diversity_plot.png", p_alpha, width = 10, height = 6, dpi = 300)
+```
+
+
+# Relative Abundance Barplots (Family & Genus)
+
+```{r rel-abund-barplots-improved, fig.width=12, fig.height=7}
+add_other_family <- function(ps_rel, taxrank = "Family", threshold = 2) {
+  psmelt(ps_rel) %>%
+    group_by(Sample) %>%
+    mutate(Taxon = ifelse(Abundance < threshold, "Other", 
+                          .data[[taxrank]])) %>%     # safe dynamic column
+    group_by(Sample, Taxon) %>%
+    summarise(Abundance = sum(Abundance), .groups = "drop")
+}
+
+# Family level
+ps_fam_rel <- tax_glom(ps, "Family") %>% 
+  transform_sample_counts(function(x) 100 * x / sum(x))
+
+p_family <- add_other_family(ps_fam_rel, threshold = 2) %>%
+  ggplot(aes(x = Sample, y = Abundance, fill = Taxon)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_viridis_d(option = "turbo") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right",
+        legend.text = element_text(size = 7.5)) +
+  labs(title = "Family-Level Relative Abundance",
+       y = "Relative Abundance (%)", x = "")
+
+print(p_family)
+ggsave("figures/family_rel_abund_100pct.png", p_family, width = 12, height = 7, dpi = 300)
+
+# Genus level (more aggressive "Other" because there are more taxa)
+add_other_genus <- function(ps_rel, taxrank = "Genus", threshold = 2) {
+  psmelt(ps_rel) %>%
+    group_by(Sample) %>%
+    mutate(Taxon = ifelse(Abundance < threshold, "Other", 
+                          .data[[taxrank]])) %>%     # safe dynamic column
+    group_by(Sample, Taxon) %>%
+    summarise(Abundance = sum(Abundance), .groups = "drop")
+}
+
+ps_gen_rel <- tax_glom(ps, "Genus") %>% 
+  transform_sample_counts(function(x) 100 * x / sum(x))
+
+p_genus <- add_other_genus(ps_gen_rel, taxrank = "Genus", threshold = 3) %>%
+  ggplot(aes(x = Sample, y = Abundance, fill = Taxon)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_viridis_d(option = "plasma") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right",
+        legend.text = element_text(size = 7)) +
+  labs(title = "Genus-Level Relative Abundance",
+       y = "Relative Abundance (%)", x = "")
+
+print(p_genus)
+ggsave("figures/genus_rel_abund_100pct.png", p_genus, width = 12, height = 7, dpi = 300)
+```
+
+# Beta-diversity (between plots)
+
+```{r beta-diversity-ordination, fig.width=10, fig.height=5}
+library(vegan)
+
+# Ordination on relative abundance (Bray-Curtis is standard)
+ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+
+# Bray-Curtis PCoA (recommended first choice)
+ord_pcoa <- ordinate(ps_rel, method = "PCoA", distance = "bray")
+
+# NMDS (for comparison)
+ord_nmds <- ordinate(ps_rel, method = "NMDS", distance = "bray", k=2, trymax=100)
+
+# === PCoA Plot ===
+p_pcoa <- plot_ordination(ps_rel, ord_pcoa, color = "sample", shape = "sample") +   # adjust variables
+  geom_point(size = 4) +
+  theme_bw() +
+  labs(title = "PCoA - Bray-Curtis Dissimilarity") +
+  stat_ellipse(aes(group = sample), level = 0.95)   # optional ellipses
+
+print(p_pcoa)
+
+# === NMDS Plot ===
+p_nmds <- plot_ordination(ps_rel, ord_nmds, color = "sample", shape = "sample") +
+  geom_point(size = 4) +
+  theme_bw() +
+  labs(title = "NMDS - Bray-Curtis") +
+  stat_ellipse(aes(group = sample), level = 0.95)
+
+print(p_nmds)
+
+# Save plots
+ggsave("figures/beta-pcoa-bray.png", p_pcoa, width = 8, height = 6, dpi = 300)
+ggsave("figures/beta-nmds-bray.png", p_nmds, width = 8, height = 6, dpi = 300)
+
+# === Distance Matrix (fixed) ===
+dist_bray <- phyloseq::distance(ps_rel, method = "bray")
+
+# === PERMANOVA ===
+cat("\n=== PERMANOVA (Bray-Curtis) ===\n")
+adonis_result <- adonis2(dist_bray ~ sample, 
+                         data = as(sample_data(ps), "data.frame"), 
+                         permutations = 999)
+print(adonis_result)
+```
+
+# Functional Groups Analysis - GENERA
+
+```{r ghg-guilds-stacked-100pct, fig.width=11, fig.height=7}
+# === Create genus-level relative abundance object ===
+ps_genus <- readRDS("output/ps-genus.rds")
+ps_genus_rel <- ps_genus %>% 
+  transform_sample_counts(function(x) 100 * x / sum(x))
+
+functional_groups <- list(
+ 
+  # === CH4 PRODUCTION (Methanogens) ===
+  "CH4_Production" = c(
+    "Methanobacterium", "Methanosaeta", "Methanothrix", "Methanosarcina",
+    "Methanoculleus", "Methanomassiliicoccus", "Methanoregula",
+    "Methanospirillum", "Methanocorpusculum", "Methanofollis", "Methanoplanus",
+    "Candidatus Methanofastidiosum"
+  ),
+ 
+  # === CH4 CONSUMPTION (Methanotrophs) ===
+  "CH4_Consumption" = c(
+    "Methylococcus", "Methylosinus", "Methylocystis", "Methylomonas",
+    "Methylobacter", "Methylocella", "Methylocapsa",
+    "Methylacidiphilum",
+    "Methylomirabilis",
+    "Candidatus Methanoperedens"
+  ),
+ 
+  # === CO2 AEROBIC ===
+  "CO2_Aerobic" = c(
+    "Mycobacterium", "Pseudomonas", "Sphingomonas", "Burkholderia", "Streptomyces",
+    "Flavobacterium", "Variovorax", "Rhizobium", "Paraburkholderia",
+    "Candidatus Koribacter", "Candidatus Solibacter"
+  ),
+ 
+  # === CO2 ANAEROBIC (Fermenters + Syntrophs + Anaerobes) ===
+  "CO2_Anaerobic" = c(
+    "Clostridium", "Bacteroides",
+    "Syntrophobacter", "Syntrophus", "Pelotomaculum", "Smithella",
+    "Geobacter",
+    "Desulfovibrio", "Desulfobacter", "Desulfotomaculum",
+    "Desulfuromonas", "Shewanella", "Anaeromyxobacter"
+  ),
+ 
+  # === NITRIFICATION ===
+  "Nitrification" = c(
+    "Nitrospira", "Nitrosomonas", "Nitrobacter", "Nitrosospira",
+    "Candidatus Nitrosopolaris"
+  ),
+ 
+  # === DENITRIFICATION ===
+  "Denitrification" = c(
+    "Denitratisoma", "Pseudomonas", "Paracoccus", "Thauera",
+    "Azoarcus", "Zoogloea", "Dechloromonas"
+  ),
+ 
+  # === N-FIXATION ===
+  "N_Fixation" = c(
+    "Bradyrhizobium", "Rhizobium", "Burkholderia", "Paraburkholderia",
+    "Azospirillum", "Azotobacter", "Frankia", "Herbaspirillum",
+    "Candidatus Celerinatantimonas", "Candidatus Koribacter"
+  )
+)
+
+# Summarize + add "Other" category so bars = 100%
+guild_summary <- ps_genus_rel %>%
+  psmelt() %>%
+  mutate(Guild = case_when(
+    Genus %in% functional_groups$CH4_Production      ~ "CH4 Production",
+    Genus %in% functional_groups$CH4_Consumption     ~ "CH4 Consumption",
+    Genus %in% functional_groups$CO2_Aerobic         ~ "CO2 Aerobic",
+    Genus %in% functional_groups$CO2_Anaerobic       ~ "CO2 Anaerobic",
+    Genus %in% functional_groups$Nitrification ~ "Nitrification",
+    Genus %in% functional_groups$Denitrification  ~ "Denitrification",
+    Genus %in% functional_groups$N_Fixation    ~ "N-Fixation",
+    TRUE ~ "Other"
+  )) %>%
+  filter(Guild != "Other") %>% 
+    mutate(Site = case_when(
+    Sample == "Jack001-WW-1" ~ "Wd-2",   # West Woodlands
+    Sample == "Jack007-BP-1" ~ "Pr-1",   # Big Prairie
+    Sample == "Jack013-SW-1" ~ "Wt-2",   # South Wetlands
+    Sample == "Jack019-EW-1" ~ "Wd-1",   # East Woodlands
+    Sample == "Jack022-NW-1" ~ "Wt-1",   # North Woodlands?
+    Sample == "Jack025-SP-1" ~ "Pr-2",   # South Prairie
+    TRUE ~ "Unknown"                     # safety net
+  )) %>% 
+  group_by(Site, Guild) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+  group_by(Site) %>%
+  mutate(Abundance = 100 * Abundance / sum(Abundance))   # ← Normalize to 100%
+
+# === Reorder Sites by increasing CH4 Consumption ===
+ch4_order <- guild_summary %>%
+  filter(Guild == "CO2 Anaerobic") %>%
+  arrange(Abundance) %>%           # Change to desc(Abundance) if you want decreasing
+  pull(Site)
+
+guild_order <- c("CH4 Consumption", "CO2 Aerobic", "Nitrification", "Denitrification", "N-Fixation", "CO2 Anaerobic", "CH4 Production")
+
+guild_summary <- guild_summary %>%
+  mutate(Site = factor(Site, levels = ch4_order),
+         Guild = factor(Guild, levels = guild_order))
+
+# Stacked 100% barplot
+p_stacked_100 <- guild_summary %>%
+  ggplot(aes(x = Site, y = Abundance, fill = Guild)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_bw() +
+  theme(axis.text.x = element_text(hjust = 1, size = 11),
+        legend.position = "right",
+        legend.text = element_text(size = 9)) +
+  labs(title = "Scaled Functional Guild Composition (Genus Level)",
+       subtitle = "Relative abundance of key GHG-related microbial guilds",
+       y = "Relative Abundance (%)", 
+       x = "") +
+  scale_fill_viridis_d(option = "turbo")
+
+print(p_stacked_100)
+
+ggsave("figures/ghg_guilds_genera_stacked_100pct.png", p_stacked_100, width = 9, height = 5, dpi = 300)
+```
+
+## Dominant genera
+
+```{r}
+# Calculate dominant genera
+ps_genus_rel %>%
+  psmelt() %>%
+  mutate(Guild = case_when(
+    Genus %in% functional_groups$CH4_Production      ~ "CH4 Production",
+    Genus %in% functional_groups$CH4_Consumption     ~ "CH4 Consumption",
+    Genus %in% functional_groups$CO2_Aerobic         ~ "CO2 Aerobic",
+    Genus %in% functional_groups$CO2_Anaerobic       ~ "CO2 Anaerobic",
+    Genus %in% functional_groups$Nitrification ~ "Nitrification",
+    Genus %in% functional_groups$Denitrification  ~ "Denitrification",
+    Genus %in% functional_groups$N_Fixation    ~ "N-Fixation",
+    TRUE ~ "Other"
+  )) %>%
+  filter(Guild != "Other") %>% 
+  group_by(Sample, Guild, Genus) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+  group_by(Sample, Guild) %>%
+  mutate(Percent = Abundance / sum(Abundance) * 100) %>%
+  slice_max(Abundance) %>% 
+  arrange(Guild)
+```
+
+## Percent Other
+
+```{r}
+# Calculate % Other (and all guilds) properly
+guild_percent <- ps_genus_rel %>%
+  psmelt() %>%
+  mutate(Guild = case_when(
+    Genus %in% functional_groups$CH4_Production      ~ "CH4 Production",
+    Genus %in% functional_groups$CH4_Consumption     ~ "CH4 Consumption",
+    Genus %in% functional_groups$CO2_Aerobic         ~ "CO2 Aerobic",
+    Genus %in% functional_groups$CO2_Anaerobic       ~ "CO2 Anaerobic",
+    Genus %in% functional_groups$Nitrification ~ "Nitrification",
+    Genus %in% functional_groups$Denitrification  ~ "Denitrification",
+    Genus %in% functional_groups$N_Fixation    ~ "N-Fixation",
+    TRUE ~ "Other"
+  )) %>%
+  group_by(Sample, Guild) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+  group_by(Sample) %>%
+  mutate(Percent = Abundance / sum(Abundance) * 100) %>%
+  ungroup()
+
+# View % Other per sample
+guild_percent %>%
+  filter(Guild == "Other") %>%
+  select(Sample, Guild, Percent)
+
+# Optional: Get overall % Other across all samples
+guild_percent %>%
+  filter(Guild == "Other") %>%
+  summarise(Mean_Percent_Other = mean(Percent))
+```
+
+
+# Functional Groups Analysis - FAMILY
+
+```{r ghg-guilds-stacked-100pct-family, fig.width=11, fig.height=7}
+# === Create genus-level relative abundance object ===
+ps_family <- readRDS("output/ps-family.rds")
+ps_family_rel <- ps_family %>% 
+  transform_sample_counts(function(x) 100 * x / sum(x))
+
+functional_groups <- list(
+ 
+  # === CH4 PRODUCTION (Methanogens) ===
+  "CH4_Production" = c(
+    "Methanobacteriaceae",
+    "Methanosaetaceae", "Methanotrichaceae",
+    "Methanosarcinaceae",
+    "Methanomicrobiaceae",
+    "Methanomassiliicoccaceae",
+    "Methanoregulaceae"
+  ),
+ 
+  # === CH4 CONSUMPTION (Methanotrophs) ===
+  "CH4_Consumption" = c(
+    "Methylococcaceae",
+    "Methylocystaceae",
+    "Methylacidiphilaceae",
+    "Methylomirabilaceae"
+  ),
+ 
+  # === CO2 AEROBIC ===
+  "CO2_Aerobic" = c(
+    "Mycobacteriaceae",
+    "Pseudomonadaceae",
+    "Sphingomonadaceae",
+    "Burkholderiaceae",
+    "Streptomycetaceae",
+    "Flavobacteriaceae",
+    "Gemmatimonadaceae",
+    "Acidobacteriaceae"
+  ),
+ 
+  # === CO2 ANAEROBIC (Fermenters + Syntrophs + Anaerobes) ===
+  "CO2_Anaerobic" = c(
+    "Clostridiaceae",
+    "Bacteroidaceae",
+    "Syntrophobacteraceae",
+    "Syntrophaceae",
+    "Pelotomaculaceae",
+    "Smithellaceae",
+    "Geobacteraceae",
+    "Desulfovibrionaceae",
+    "Desulfuromonadaceae",
+    "Desulfobacteraceae",
+    "Desulfotomaculaceae",
+    "Shewanellaceae",
+    "Myxococcaceae"
+  ),
+ 
+  # === NITRIFICATION ===
+  "Nitrification" = c(
+    "Nitrospiraceae",
+    "Nitrosomonadaceae",
+    "Nitrobacteraceae"
+  ),
+ 
+  # === DENITRIFICATION ===
+  "Denitrification" = c(
+    "Rhodocyclaceae",
+    "Pseudomonadaceae",
+    "Burkholderiaceae"
+  ),
+ 
+  # === N-FIXATION ===
+  "N_Fixation" = c(
+    "Bradyrhizobiaceae",
+    "Rhizobiaceae",
+    "Beijerinckiaceae",
+    "Xanthobacteraceae",
+    "Burkholderiaceae"
+  )
+)
+# === Summarize with "Other" category ===
+guild_summary <- ps_family_rel %>%
+  psmelt() %>%
+mutate(Guild = case_when(
+    Family %in% functional_groups$CH4_Production     ~ "CH4 Production",
+    Family %in% functional_groups$CH4_Consumption    ~ "CH4 Consumption",
+    Family %in% functional_groups$CO2_Aerobic        ~ "CO2 Aerobic",
+    Family %in% functional_groups$CO2_Anaerobic ~ "CO2 Anaerobic",
+    Family %in% functional_groups$Nitrification      ~ "Nitrification",
+    Family %in% functional_groups$Denitrification    ~ "Denitrification",
+    Family %in% functional_groups$N_Fixation         ~ "N-Fixation",
+    TRUE ~ "Other"
+  )) %>%
+    filter(Guild != "Other") %>% 
+    mutate(Site = case_when(
+    Sample == "Jack001-WW-1" ~ "Wd-2",   # West Woodlands
+    Sample == "Jack007-BP-1" ~ "Pr-1",   # Big Prairie
+    Sample == "Jack013-SW-1" ~ "Wt-2",   # South Wetlands
+    Sample == "Jack019-EW-1" ~ "Wd-1",   # East Woodlands
+    Sample == "Jack022-NW-1" ~ "Wt-1",   # North Woodlands?
+    Sample == "Jack025-SP-1" ~ "Pr-2",   # South Prairie
+    TRUE ~ "Unknown"                     # safety net
+  )) %>% 
+  group_by(Site, Guild) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+  group_by(Site) %>%
+  mutate(Abundance = 100 * Abundance / sum(Abundance))   # Normalize to 100%
+
+# === Reorder Sites by increasing CO2 Aerobic ===
+ch4_order <- guild_summary %>%
+  filter(Guild == "CH4 Consumption") %>%
+  arrange(Abundance) %>%           # Change to desc(Abundance) if you want decreasing
+  pull(Site)
+
+guild_order <- c("CH4 Consumption", "CO2 Aerobic", "Nitrification", "Denitrification", "N-Fixation", "CO2 Anaerobic", "CH4 Production")
+
+guild_summary <- guild_summary %>%
+  mutate(Site = factor(Site, levels = ch4_order),
+         Guild = factor(Guild, levels = guild_order))
+
+# === Stacked 100% barplot with reordered x-axis ===
+p_stacked_100 <- guild_summary %>%
+  ggplot(aes(x = Site, y = Abundance, fill = Guild)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        legend.position = "right",
+        legend.text = element_text(size = 9)) +
+  labs(title = "Functional Guild Composition (Family Level)",
+       subtitle = "Sites ordered by increasing CH4 Consumption",
+       y = "Relative Abundance (%)",
+       x = "") +
+  scale_fill_viridis_d(option = "turbo")
+
+print(p_stacked_100)
+
+ggsave("figures/ghg_guilds_family_stacked_100pct.png", 
+       p_stacked_100, width = 9, height = 5, dpi = 300)
+```
+
+## Dominant families
+
+```{r}
+# Calculate dominant family
+ps_family_rel %>%
+  psmelt() %>%
+mutate(Guild = case_when(
+    Family %in% functional_groups$CH4_Production     ~ "CH4 Production",
+    Family %in% functional_groups$CH4_Consumption    ~ "CH4 Consumption",
+    Family %in% functional_groups$CO2_Aerobic        ~ "CO2 Aerobic",
+    Family %in% functional_groups$CO2_Anaerobic ~ "CO2 Anaerobic",
+    Family %in% functional_groups$Nitrification      ~ "Nitrification",
+    Family %in% functional_groups$Denitrification    ~ "Denitrification",
+    Family %in% functional_groups$N_Fixation         ~ "N-Fixation",
+    TRUE ~ "Other"
+  )) %>%
+  filter(Guild != "Other") %>% 
+  group_by(Sample, Guild, Family) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+  group_by(Sample, Guild) %>%
+  mutate(Percent = Abundance / sum(Abundance) * 100) %>%
+  slice_max(Abundance) %>% 
+  arrange(Guild)
+```
+
+## Parse CO2 Aerobic Families
+
+```{r}
+# Calculate dominant family within CO2 Aerobic
+ps_family_rel %>%
+  psmelt() %>%
+  mutate(Guild = case_when(
+    Family %in% functional_groups$CH4_Production     ~ "CH4 Production",
+    Family %in% functional_groups$CH4_Consumption    ~ "CH4 Consumption",
+    Family %in% functional_groups$CO2_Aerobic        ~ "CO2 Aerobic",
+    Family %in% functional_groups$CO2_Anaerobic ~ "CO2 Anaerobic",
+    Family %in% functional_groups$Nitrification      ~ "Nitrification",
+    Family %in% functional_groups$Denitrification    ~ "Denitrification",
+    Family %in% functional_groups$N_Fixation         ~ "N-Fixation",
+    TRUE ~ "Other"
+  )) %>%
+  filter(Guild == "CO2 Aerobic") %>% 
+  group_by(Sample, Guild, Family) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+  group_by(Sample, Guild) %>%
+  mutate(Percent = Abundance / sum(Abundance) * 100) %>%
+  slice_max(Abundance, n = 3) %>% 
+  arrange()
+```
+
+## Percent Other
+
+```{r}
+# === Calculate % Other (Family level) ===
+guild_percent <- ps_family_rel %>%
+  psmelt() %>%
+  mutate(Guild = case_when(
+    Family %in% functional_groups$CH4_Production     ~ "CH4 Production",
+    Family %in% functional_groups$CH4_Consumption    ~ "CH4 Consumption",
+    Family %in% functional_groups$CO2_Aerobic        ~ "CO2 Aerobic",
+    Family %in% functional_groups$CO2_Anaerobic ~ "CO2 Anaerobic",
+    Family %in% functional_groups$Nitrification      ~ "Nitrification",
+    Family %in% functional_groups$Denitrification    ~ "Denitrification",
+    Family %in% functional_groups$N_Fixation         ~ "N-Fixation",
+    TRUE ~ "Other"
+  )) %>%
+  group_by(Sample, Guild) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+  group_by(Sample) %>%
+  mutate(Percent = Abundance / sum(Abundance) * 100) %>%
+  ungroup()
+
+# View % Other per sample
+guild_percent %>%
+  filter(Guild == "Other") %>%
+  select(Sample, Guild, Percent)
+
+# Get overall average % Other across all samples
+guild_percent %>%
+  filter(Guild == "Other") %>%
+  summarise(Mean_Percent_Other = mean(Percent))
+```
+
