@@ -1,0 +1,7 @@
+Accession	Sample Name	SPUID	Organism	Tax ID	
+SAMN61436570	Nachusa_Pr1	Nachusa_Pr1	soil metagenome	410658	
+SAMN61436571	Nachusa_Pr2	Nachusa_Pr2	soil metagenome	410658	
+SAMN61436572	Nachusa_Wd1	Nachusa_Wd1	soil metagenome	410658	
+SAMN61436573	Nachusa_Wd2	Nachusa_Wd2	soil metagenome	410658	
+SAMN61436574	Nachusa_Wt1	Nachusa_Wt1	soil metagenome	410658	
+SAMN61436575	Nachusa_Wt2	Nachusa_Wt2	soil metagenome	410658	
