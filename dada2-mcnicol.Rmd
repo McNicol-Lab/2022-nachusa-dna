@@ -361,37 +361,50 @@ ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows = FALSE),
                sample_data(all_metadata))
 
 # Save everything
-saveRDS(ps, "output/ps-nachusa-2022-fwd-nochim-final.rds")
-saveRDS(ps_family, "output/ps-family.rds")
-saveRDS(ps_genus, "output/ps-genus.rds")
+# saveRDS(ps, "output/ps-nachusa-2022-fwd-nochim-final.rds")
+# saveRDS(ps_family, "output/ps-family.rds")
+# saveRDS(ps_genus, "output/ps-genus.rds")
 
-# === FAMILY LEVEL TABLE ===
-cat("\n=== Top 20 Most Abundant Families ===\n")
-family_abund <- tax_glom(ps, taxrank = "Family") %>%
-  transform_sample_counts(function(x) 100 * x / sum(x)) %>%  # relative abundance
+ps <- readRDS("output/ps-nachusa-2022-fwd-nochim-final.rds")
+ps_family <- readRDS("output/ps-family.rds")
+ps_genus <- readRDS("output/ps-genus.rds")
+
+
+# === FAMILY LEVEL - Top abundances PER SAMPLE ===
+cat("\n=== Top 10 Most Abundant Families per Sample ===\n")
+
+family_abund_by_sample <- tax_glom(ps, taxrank = "Family") %>%
+  transform_sample_counts(function(x) 100 * x / sum(x)) %>%   # relative abundance per sample
   psmelt() %>%
-  group_by(Family) %>%
-  summarise(Mean_Rel_Abund = mean(Abundance), .groups = "drop") %>%
-  arrange(desc(Mean_Rel_Abund)) %>%
-  slice_head(n = 20)
+  group_by(Sample, Family) %>%
+  summarise(Rel_Abund = sum(Abundance), .groups = "drop") %>%
+  group_by(Sample) %>%
+  arrange(Sample, desc(Rel_Abund)) %>%
+  slice_head(n = 10) %>%                    # Change to 15 or 20 if you want more
+  ungroup()
 
-print(family_abund)
+print(family_abund_by_sample)
 
-# === GENUS LEVEL TABLE ===
-cat("\n=== Top 20 Most Abundant Genera ===\n")
-genus_abund <- tax_glom(ps, taxrank = "Genus") %>%
+# Optional: Save as CSV
+write_csv(family_abund_by_sample, "output/top_families_per_sample.csv")
+
+# === GENUS LEVEL - Top abundances PER SAMPLE ===
+cat("\n=== Top 10 Most Abundant Genera per Sample ===\n")
+
+genus_abund_by_sample <- tax_glom(ps, taxrank = "Genus") %>%
   transform_sample_counts(function(x) 100 * x / sum(x)) %>%
   psmelt() %>%
-  group_by(Genus) %>%
-  summarise(Mean_Rel_Abund = mean(Abundance), .groups = "drop") %>%
-  arrange(desc(Mean_Rel_Abund)) %>%
-  slice_head(n = 20)
+  group_by(Sample, Genus) %>%
+  summarise(Rel_Abund = sum(Abundance), .groups = "drop") %>%
+  group_by(Sample) %>%
+  arrange(Sample, desc(Rel_Abund)) %>%
+  slice_head(n = 10) %>%
+  ungroup()
 
-print(genus_abund)
+print(genus_abund_by_sample)
 
-# Save tables
-write_csv(family_abund, "output/top_families.csv")
-write_csv(genus_abund, "output/top_genera.csv")
+# Optional: Save as CSV
+write_csv(genus_abund_by_sample, "output/top_genera_per_sample.csv")
 ```
 
 # Alpha Diversity Table + Plot
